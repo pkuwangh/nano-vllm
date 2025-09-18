@@ -8,7 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, set_context_spec, reset_context_spec
 from nanovllm.utils.loader import load_model
 
 
@@ -23,11 +23,22 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        self.positions_spec = None
+        self.slot_mapping_spec = None
+        self.context_lens_spec = None
+        self.seqs_spec = None
+        self.hidden_states_spec = None
+        self.residual_spec = None
+        self.block_tables_cpu = None
+        self.block_tables_cpu_spec = None
+        self.spec_layers = config.num_speculative_layers
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        self.spec_stream = torch.cuda.Stream(device="cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -35,6 +46,7 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -118,8 +130,8 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        self.block_tables_cpu = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = torch.tensor(self.block_tables_cpu, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -150,7 +162,7 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -165,18 +177,27 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        positions_spec = []
+        slot_mapping_spec = []
+        context_lens_spec = []
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
+            positions_spec.append(len(seq))
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            context_lens_spec.append(len(seq) + 1)
+            slot_mapping.append(seq.get_decode_slot())
+            slot_mapping_spec.append(seq.get_decode_slot_spec())
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        positions_spec = torch.tensor(positions_spec, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_spec = torch.tensor(slot_mapping_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_spec = torch.tensor(context_lens_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
+        return input_ids, positions, positions_spec, slot_mapping_spec, context_lens_spec
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -186,13 +207,76 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
+    def pre_populate_graph_vars_for_spec(self, bs: int):
+        if not self.enforce_eager:
+            context = get_context()
+            graph_vars = self.graph_vars
+            graph_vars["slot_mapping_spec"].fill_(-1)
+            graph_vars["slot_mapping_spec"][:bs] = context.slot_mapping_spec
+            graph_vars["context_lens_spec"].zero_()
+            graph_vars["context_lens_spec"][:bs] = context.context_lens_spec
+            # block_tables should be same with resume
+
+    @torch.inference_mode()
+    def run_model_spec(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        if self.enforce_eager:
+            self.hidden_states_spec, self.residual_spec = self.model.forward_spec(
+                input_ids,
+                positions,
+                num_layers_to_run=self.spec_layers,
+            )
+        else:
+            bs = input_ids.size(0)
+            graph = self.graphs["spec"][next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph.replay()
+            # self.hidden_states_spec = graph_vars["hidden_states"][:bs]
+            # self.residual_spec = graph_vars["residual"][:bs]
+
+    @torch.inference_mode()
+    def pre_populate_graph_vars_for_resume(self, bs: int):
+        if not self.enforce_eager:
+            context = get_context()
+            graph_vars = self.graph_vars
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping_spec
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs] = context.context_lens_spec
+
+    @torch.inference_mode()
+    def run_model_resume(self, input_ids: torch.Tensor, positions: torch.Tensor, block_tables_updated: bool):
+        if self.enforce_eager:
+            hidden_states = self.model.forward_resume(
+                input_ids,
+                positions,
+                resume_from_layer_index=(self.spec_layers + 1),
+                resume_hidden_states=self.hidden_states_spec,
+                resume_residual=self.residual_spec,
+            )
+            return self.model.compute_logits(hidden_states)
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.graphs["resume"][next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
+            if block_tables_updated:
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # input_ids & positions should be same with spec-execution
+            # hidden_states & residual are filled by spec-execution
+            # slot_mapping & context_lens are pre-populated by spec-execution
+            graph.replay()
+            return self.model.compute_logits(graph_vars["resume_outputs"][:bs])
+
+    @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs["default"][next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -205,46 +289,142 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
-        return token_ids
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions, self.positions_spec, self.slot_mapping_spec, self.context_lens_spec = (
+                self.prepare_decode(seqs)
+            )
+        # wait till last-iteration's speculation is done
+        if self.seqs_spec is not None:
+            self.spec_stream.synchronize()
+            reset_context_spec()
+        # now really starts this iterations
+        if is_prefill:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            self.seqs_spec = None
+            return token_ids
+        elif self.spec_layers is None:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            self.seqs_spec = None
+            return token_ids
+        else:
+            if (
+                self.seqs_spec is not None
+                and len(self.seqs_spec) == len(seqs)
+                and all(a.seq_id == b.seq_id for a, b in zip(self.seqs_spec, seqs))
+            ):
+                # sepculated last iteration and same batch, resume
+                block_tables_updated = self.block_tables_cpu != self.block_tables_cpu_spec
+                logits = self.run_model_resume(input_ids, positions, block_tables_updated)
+            else:
+                # no speculation or mis-speculated
+                logits = self.run_model(input_ids, positions, is_prefill=False)
+            # queue the sampler first
+            token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
+            # pre-populate some graph vars for the speculative execution
+            set_context_spec(self.slot_mapping_spec, self.context_lens_spec)
+            self.pre_populate_graph_vars_for_spec(input_ids.size(0))
+            # wait for above to finish
+            prod_stream = torch.cuda.current_stream(device="cuda")
+            self.spec_stream.wait_stream(prod_stream)
+            # now speculate next iteration will have the same batch
+            with torch.cuda.stream(self.spec_stream):
+                self.run_model_spec(token_ids_gpu, self.positions_spec)
+            self.seqs_spec = seqs
+            self.block_tables_cpu_spec = [[x for x in y] for y in self.block_tables_cpu]
+            # spec execution submitted; now do CPU business
+            token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
+            # pre-populate some graph vars for next-iteration resume
+            self.pre_populate_graph_vars_for_resume(input_ids.size(0))
+            return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = (config.max_model_len + 1 + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        slot_mapping_spec = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens_spec = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
+        residual = torch.zeros(max_bs, hf_config.hidden_size)
+        resume_outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
+        self.graph_names = ["default", "spec", "resume"]
+        self.graphs = {x: {} for x in self.graph_names}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context_spec(slot_mapping_spec=slot_mapping_spec[:bs], context_lens_spec=context_lens_spec[:bs])
+
+            # default graph
+            graph1 = torch.cuda.CUDAGraph()
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            with torch.cuda.graph(graph1, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
+                self.graph_pool = graph1.pool()
+            self.graphs["default"][bs] = graph1
             torch.cuda.synchronize()
+
+            if self.spec_layers is not None:
+                # spec graph
+                graph2 = torch.cuda.CUDAGraph()
+                hidden_states[:bs], residual[:bs] = self.model.forward_spec(
+                    input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
+                )  # warmup
+                with torch.cuda.graph(graph2, self.graph_pool):
+                    hidden_states[:bs], residual[:bs] = self.model.forward_spec(
+                        input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
+                    )  # capture
+                self.graphs["spec"][bs] = graph2
+                torch.cuda.synchronize()
+
+                # resume graph
+                graph3 = torch.cuda.CUDAGraph()
+                resume_outputs[:bs] = self.model.forward_resume(
+                    input_ids[:bs],
+                    positions[:bs],
+                    resume_from_layer_index=(self.spec_layers + 1),
+                    resume_hidden_states=hidden_states[:bs],
+                    resume_residual=residual[:bs],
+                )  # warmup
+                with torch.cuda.graph(graph3, self.graph_pool):
+                    resume_outputs[:bs] = self.model.forward_resume(
+                        input_ids[:bs],
+                        positions[:bs],
+                        resume_from_layer_index=(self.spec_layers + 1),
+                        resume_hidden_states=hidden_states[:bs],
+                        resume_residual=residual[:bs],
+                    )
+                self.graphs["resume"][bs] = graph3
+                torch.cuda.synchronize()
+
             reset_context()
+            reset_context_spec()
 
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
+            slot_mapping_spec=slot_mapping_spec,
+            context_lens_spec=context_lens_spec,
             block_tables=block_tables,
             outputs=outputs,
+            hidden_states=hidden_states,
+            residual=residual,
+            resume_outputs=resume_outputs,
         )

@@ -70,6 +70,7 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        is_spec: bool,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -77,7 +78,7 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
+        o = self.attn(q, k, v, is_spec)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -142,12 +143,13 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        is_spec: False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states, is_spec)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -168,13 +170,30 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
+        num_layers_to_run: int | None = None,
+        resume_from_layer_index: int | None = None,
+        resume_hidden_states: torch.Tensor | None = None,
+        resume_residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if resume_from_layer_index is not None:
+            hidden_states = resume_hidden_states
+            residual = resume_residual
+        else:
+            hidden_states = self.embed_tokens(input_ids)
+            residual = None
+
+        index = 0
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            index += 1
+            if resume_from_layer_index is not None and index < resume_from_layer_index:
+                continue
+            is_spec = num_layers_to_run is not None
+            hidden_states, residual = layer(positions, hidden_states, residual, is_spec)
+            if num_layers_to_run is not None and index == num_layers_to_run:
+                return hidden_states, residual
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, None
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -201,7 +220,31 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions)[0]
+
+    def forward_spec(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        num_layers_to_run: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model(input_ids, positions, num_layers_to_run=num_layers_to_run)
+
+    def forward_resume(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        resume_from_layer_index: int | None = None,
+        resume_hidden_states: torch.Tensor | None = None,
+        resume_residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.model(
+            input_ids,
+            positions,
+            resume_from_layer_index=resume_from_layer_index,
+            resume_hidden_states=resume_hidden_states,
+            resume_residual=resume_residual,
+        )[0]
 
     def compute_logits(
         self,
