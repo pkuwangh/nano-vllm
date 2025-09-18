@@ -1,4 +1,5 @@
 import atexit
+from loguru import logger
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -66,10 +67,15 @@ class LLMEngine:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        if isinstance(prompts[0], str):
+            logger.info(f"{len(prompts)=} prompts - per-seq words: {[len(x.split()) for x in prompts]}")
+        else:
+            logger.info(f"{len(prompts)=} prompts - per-seq tokens: {[len(x) for x in prompts]}")
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        num_steps = 0
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
@@ -82,10 +88,12 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
+            num_steps += 1
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
+                logger.info(f"{seq_id=} done at step={num_steps}: {len(token_ids)=} {len(outputs[seq_id])=}")
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:

@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
+from loguru import logger
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention

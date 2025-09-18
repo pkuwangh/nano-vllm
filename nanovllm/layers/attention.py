@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+from loguru import logger
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
