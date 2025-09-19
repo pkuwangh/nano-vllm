@@ -35,6 +35,11 @@ class Sequence:
         return self.token_ids[key]
 
     @property
+    def num_tokens_for_kvcache(self):
+        # always allocate one more token for kvcache
+        return self.num_tokens + 1
+
+    @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
 
@@ -53,6 +58,10 @@ class Sequence:
     @property
     def num_cached_blocks(self):
         return self.num_cached_tokens // self.block_size
+
+    @property
+    def num_blocks_for_kvcache_alloc(self):
+        return (self.num_tokens_for_kvcache + self.block_size - 1) // self.block_size
 
     @property
     def num_blocks(self):

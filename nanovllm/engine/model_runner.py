@@ -252,7 +252,7 @@ class ModelRunner:
                     resume_hidden_states=hidden_states_spec,
                     resume_residual=residual_spec,
                 )
-            return self.model.compute_logits(hidden_states)
+                return self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
             context = get_context()
