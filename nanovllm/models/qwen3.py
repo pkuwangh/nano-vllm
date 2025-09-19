@@ -238,14 +238,14 @@ class Qwen3ForCausalLM(nn.Module):
         resume_from_layer_index: int | None = None,
         resume_hidden_states: torch.Tensor | None = None,
         resume_residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         return self.model(
             input_ids,
             positions,
             resume_from_layer_index=resume_from_layer_index,
             resume_hidden_states=resume_hidden_states,
             resume_residual=resume_residual,
-        )
+        )[0]
 
     def compute_logits(
         self,

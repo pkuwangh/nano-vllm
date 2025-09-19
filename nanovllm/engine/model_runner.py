@@ -268,7 +268,7 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs["default"][next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -299,6 +299,11 @@ class ModelRunner:
             self.seqs_spec = None
             return token_ids
         else:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            self.seqs_spec = None
+            return token_ids
+
             if (
                 self.seqs_spec is not None
                 and len(self.seqs_spec) == len(seqs)
@@ -329,34 +334,78 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = (config.max_model_len + 1 + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        slot_mapping_spec = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens_spec = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        hidden_states = torch.zeros(max_bs, hf_config.hidden_size)
+        residual = torch.zeros(max_bs, hf_config.hidden_size)
+        resume_outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
+        self.graph_names = ["default", "spec", "resume"]
+        self.graphs = {x: {} for x in self.graph_names}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context_spec(slot_mapping_spec=slot_mapping_spec[:bs], context_lens_spec=context_lens_spec[:bs])
+
+            # default graph
+            graph1 = torch.cuda.CUDAGraph()
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            with torch.cuda.graph(graph1, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
+                self.graph_pool = graph1.pool()
+            self.graphs["default"][bs] = graph1
             torch.cuda.synchronize()
+
+            # spec graph
+            graph2 = torch.cuda.CUDAGraph()
+            hidden_states[:bs], residual[:bs] = self.model.forward_spec(input_ids[:bs], positions[:bs], num_layers_to_run=5)  # warmup
+            with torch.cuda.graph(graph2, self.graph_pool):
+                hidden_states[:bs], residual[:bs] = self.model.forward_spec(input_ids[:bs], positions[:bs], num_layers_to_run=5)  # capture
+            self.graphs["spec"][bs] = graph2
+            torch.cuda.synchronize()
+
+            # resume graph
+            graph3 = torch.cuda.CUDAGraph()
+            resume_outputs[:bs] = self.model.forward_resume(
+                input_ids[:bs],
+                positions[:bs],
+                resume_from_layer_index=6,
+                resume_hidden_states=hidden_states[:bs],
+                resume_residual=residual[:bs],
+            )  # warmup
+            with torch.cuda.graph(graph3, self.graph_pool):
+                resume_outputs[:bs] = self.model.forward_resume(
+                    input_ids[:bs],
+                    positions[:bs],
+                    resume_from_layer_index=6,
+                    resume_hidden_states=hidden_states[:bs],
+                    resume_residual=residual[:bs],
+                )
+            self.graphs["resume"][bs] = graph3
+            torch.cuda.synchronize()
+
             reset_context()
+
 
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
+            slot_mapping_spec=slot_mapping,
+            context_lens_spec=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+            hidden_states=hidden_states,
+            residual=residual,
+            resume_outputs=resume_outputs,
         )
