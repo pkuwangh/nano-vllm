@@ -14,7 +14,6 @@ class Context:
     block_tables: torch.Tensor | None = None
     slot_mapping_spec: torch.Tensor | None = None
     context_lens_spec: torch.Tensor | None = None
-    block_tables_spec: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -31,9 +30,6 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
-    slot_mapping_spec=None,
-    context_lens_spec=None,
-    block_tables_spec=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -45,12 +41,21 @@ def set_context(
         slot_mapping,
         context_lens,
         block_tables,
-        slot_mapping_spec,
-        context_lens_spec,
-        block_tables_spec,
     )
+
+
+def set_context_spec(slot_mapping_spec, context_lens_spec):
+    global _CONTEXT
+    _CONTEXT.slot_mapping_spec = slot_mapping_spec
+    _CONTEXT.context_lens_spec = context_lens_spec
+
+
+def reset_context_spec():
+    global _CONTEXT
+    _CONTEXT.slot_mapping_spec = None
+    _CONTEXT.context_lens_spec = None
 
 
 def reset_context():
     global _CONTEXT
-    _CONTEXT = Context()
+    set_context(False)

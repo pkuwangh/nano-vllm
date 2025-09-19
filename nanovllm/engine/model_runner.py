@@ -9,7 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, set_context_spec, reset_context_spec
 from nanovllm.utils.loader import load_model
 
 
@@ -25,6 +25,14 @@ class ModelRunner:
         self.event = event
         self.logged_prefill = True
         self.logged_decode = True
+
+        self.input_ids_spec = None
+        self.positions_spec = None
+        self.slot_mapping_spec = None
+        self.context_lens_spec = None
+        self.seqs_spec = None
+        self.hidden_states_spec = None
+        self.residual_spec = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -185,7 +193,7 @@ class ModelRunner:
             logger.debug(f"{positions=}")
             logger.debug(f"{slot_mapping=}")
             logger.debug(f"{block_tables=}")
-            # self.logged_prefill = True
+            self.logged_prefill = True
             break
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
@@ -215,31 +223,21 @@ class ModelRunner:
         slot_mapping_spec = torch.tensor(slot_mapping_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_spec = torch.tensor(context_lens_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        block_tables_spec = self.prepare_block_tables(seqs) # TODO
         while not self.logged_decode:
-            # logger.info(f"Decode staging: {len(seqs)=}")
-            # logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
-            # logger.debug(f"{input_ids=}")
-            # logger.debug(f"{positions=}")
-            # logger.debug(f"{positions_spec=}")
+            logger.info(f"Decode staging: {len(seqs)=}")
+            logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
+            logger.debug(f"{input_ids=}")
+            logger.debug(f"{positions=}")
+            logger.debug(f"{positions_spec=}")
             logger.debug(f"{slot_mapping=}")
             logger.debug(f"{slot_mapping_spec=}")
-            # logger.debug(f"{context_lens=}")
-            # logger.debug(f"{context_lens_spec=}")
-            # logger.debug(f"{block_tables=}")
-            # logger.debug(f"{block_tables_spec=}")
-            # self.logged_decode = True
+            logger.debug(f"{context_lens=}")
+            logger.debug(f"{context_lens_spec=}")
+            logger.debug(f"{block_tables=}")
+            self.logged_decode = True
             break
-        set_context(
-            False,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            slot_mapping_spec=slot_mapping_spec,
-            context_lens_spec=context_lens_spec,
-            block_tables_spec=block_tables_spec,
-        )
-        return input_ids, positions
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions, positions_spec, slot_mapping_spec, context_lens_spec
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -249,20 +247,24 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
+    def run_model_spec(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        self.hidden_states_spec, self.residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=5)
+
+    @torch.inference_mode()
+    def run_model_resume(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        hidden_states, _ = self.model.forward_resume(
+            input_ids,
+            positions,
+            resume_from_layer_index=6,
+            resume_hidden_states=self.hidden_states_spec,
+            resume_residual=self.residual_spec,
+        )
+        return self.model.compute_logits(hidden_states)
+
+    @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            if is_prefill:
-                return self.model.compute_logits(self.model(input_ids, positions))
-            else:
-                hidden_states_spec, residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=10)
-                hidden_states, _ = self.model.forward_resume(
-                    input_ids,
-                    positions,
-                    resume_from_layer_index=11,
-                    resume_hidden_states=hidden_states_spec,
-                    resume_residual=residual_spec,
-                )
-                return self.model.compute_logits(hidden_states)
+            return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -279,15 +281,48 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
-        if self.rank == 0:
-            logger.info(f"{token_ids_gpu.shape=} {token_ids_gpu.device=}")
-        token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
         reset_context()
-        return token_ids
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+        else:
+            input_ids, positions, self.positions_spec, self.slot_mapping_spec, self.context_lens_spec = self.prepare_decode(seqs)
+        # wait till last-iteration's speculation is done
+        if self.seqs_spec is not None:
+            stream = torch.cuda.default_stream()
+            stream.synchronize()
+            reset_context_spec()
+        # now really starts this iterations
+        if is_prefill:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            self.seqs_spec = None
+            return token_ids
+        else:
+            if (
+                self.seqs_spec is not None
+                and len(self.seqs_spec) == len(seqs)
+                and all(a.seq_id == b.seq_id for a, b in zip(self.seqs_spec, seqs))
+            ):
+                # sepculated last iteration and same batch, resume
+                logger.info("batch speculation was GOOD; resume from speculative executed layers")
+                logits = self.run_model_resume(input_ids, positions)
+            else:
+                # no speculation or mis-speculated
+                if self.seqs_spec is not None:
+                    logger.info("batch speculation was BAD; re-run from beginning")
+                logits = self.run_model(input_ids, positions, is_prefill=False)
+            # queue the sampler first
+            token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
+            # now speculate next iteration will have the same batch
+            set_context_spec(self.slot_mapping_spec, self.context_lens_spec)
+            self.seqs_spec = seqs
+            input_ids_spec = token_ids_gpu
+            # logger.info(f"Speculating with {input_ids_spec=} {self.positions_spec=} {input_ids_spec.device=} {self.positions_spec.device=}")
+            self.run_model_spec(input_ids_spec, self.positions_spec)
+            # above spec launch is async, let's process the sampled token_ids now
+            token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
+            return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
