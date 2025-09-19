@@ -41,7 +41,11 @@ class Scheduler:
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:
-            logger.info(f"Schedule {len(scheduled_seqs)} seqs for prefill: waiting={len(self.waiting)} running={len(self.running)}")
+            logger.debug(
+                f"Schedule {len(scheduled_seqs)} seqs for prefill "
+                f"(waiting={len(self.waiting)} running={len(self.running)}): "
+                f"{[x.seq_id for x in scheduled_seqs]}"
+            )
             return scheduled_seqs, True
 
         # decode
@@ -65,6 +69,10 @@ class Scheduler:
         assert scheduled_seqs
         # push the scheduled seqs to the left of running deque, in the same order they were scheduled
         self.running.extendleft(reversed(scheduled_seqs))
+        logger.debug(
+            f"Schedule {len(scheduled_seqs)} seqs for decode: "
+            f"{[x.seq_id for x in scheduled_seqs]}"
+        )
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
@@ -76,8 +84,8 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                logger.info(f"Sequence {seq.seq_id} finished: {seq.num_completion_tokens}/{seq.max_tokens} tokens, "
-                            f"last token={token_id}/{self.eos}")
+                logger.debug(f"Sequence {seq.seq_id} finished: {seq.num_completion_tokens}/{seq.max_tokens} tokens, "
+                             f"last token={token_id}/{self.eos}")
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

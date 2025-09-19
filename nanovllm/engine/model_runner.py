@@ -139,7 +139,6 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         if not (self.logged_prefill and self.logged_decode):
             logger.info(f"{block_tables.shape=} {block_tables.dtype=} {block_tables.device=}")
-            logger.debug(f"{block_tables=}")
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -183,6 +182,7 @@ class ModelRunner:
             logger.info(f"prefill staging: {len(seqs)=} {max_seqlen_q=} {max_seqlen_k=}")
             logger.info(f"{input_ids.shape=} {cu_seqlens_q.shape=} {cu_seqlens_k.shape=} {slot_mapping.shape=}")
             logger.debug(f"{slot_mapping=}")
+            logger.debug(f"{block_tables=}")
             self.logged_prefill = True
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
@@ -192,23 +192,43 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        slot_mapping_spec = []
+        context_lens_spec = []
         for seq in seqs:
             input_ids.append(seq.last_token)    # new input token is the last output token
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))       # KV length this query should attend over
+            context_lens_spec.append(len(seq))
             # where to write this token's KV
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping_spec.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_spec = torch.tensor(slot_mapping_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens_spec = torch.tensor(context_lens_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        block_tables_spec = self.prepare_block_tables(seqs)
         if not self.logged_decode:
             logger.info(f"Decode staging: {len(seqs)=}")
             logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
             logger.debug(f"{slot_mapping=}")
+            logger.debug(f"{slot_mapping_spec=}")
+            logger.debug(f"{context_lens=}")
+            logger.debug(f"{context_lens_spec=}")
+            logger.debug(f"{block_tables=}")
+            logger.debug(f"{block_tables_spec=}")
             self.logged_decode = True
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            slot_mapping_spec=slot_mapping_spec,
+            context_lens_spec=context_lens_spec,
+            block_tables_spec=block_tables_spec,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -221,7 +241,18 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            if is_prefill:
+                return self.model.compute_logits(self.model(input_ids, positions))
+            else:
+                hidden_states_spec, residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=10)
+                hidden_states, _ = self.model.forward_resume(
+                    input_ids,
+                    positions,
+                    resume_from_layer_index=11,
+                    resume_hidden_states=hidden_states_spec,
+                    resume_residual=residual_spec,
+                )
+            return self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -241,7 +272,10 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
+        if self.rank == 0:
+            logger.info(f"{token_ids_gpu.shape=} {token_ids_gpu.dtype=} {token_ids_gpu.device=}")
+        token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
