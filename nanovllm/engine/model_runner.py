@@ -138,7 +138,7 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]  # pad each seq's block_table
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         if not (self.logged_prefill and self.logged_decode):
-            logger.info(f"{block_tables.shape=} {block_tables.dtype=} {block_tables.device=}")
+            logger.info(f"{block_tables.shape=}")
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -178,12 +178,15 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        if not self.logged_prefill:
+        while not self.logged_prefill:
             logger.info(f"prefill staging: {len(seqs)=} {max_seqlen_q=} {max_seqlen_k=}")
             logger.info(f"{input_ids.shape=} {cu_seqlens_q.shape=} {cu_seqlens_k.shape=} {slot_mapping.shape=}")
+            logger.debug(f"{input_ids=}")
+            logger.debug(f"{positions=}")
             logger.debug(f"{slot_mapping=}")
             logger.debug(f"{block_tables=}")
-            self.logged_prefill = True
+            # self.logged_prefill = True
+            break
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -192,34 +195,41 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        positions_spec = []
         slot_mapping_spec = []
         context_lens_spec = []
         for seq in seqs:
             input_ids.append(seq.last_token)    # new input token is the last output token
             positions.append(len(seq) - 1)
+            positions_spec.append(len(seq))
             context_lens.append(len(seq))       # KV length this query should attend over
-            context_lens_spec.append(len(seq))
+            context_lens_spec.append(len(seq) + 1)
             # where to write this token's KV
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-            slot_mapping_spec.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.get_decode_slot())
+            slot_mapping_spec.append(seq.get_decode_slot_spec())
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        positions_spec = torch.tensor(positions_spec, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_spec = torch.tensor(slot_mapping_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_spec = torch.tensor(context_lens_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        block_tables_spec = self.prepare_block_tables(seqs)
-        if not self.logged_decode:
-            logger.info(f"Decode staging: {len(seqs)=}")
-            logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
+        block_tables_spec = self.prepare_block_tables(seqs) # TODO
+        while not self.logged_decode:
+            # logger.info(f"Decode staging: {len(seqs)=}")
+            # logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
+            # logger.debug(f"{input_ids=}")
+            # logger.debug(f"{positions=}")
+            # logger.debug(f"{positions_spec=}")
             logger.debug(f"{slot_mapping=}")
             logger.debug(f"{slot_mapping_spec=}")
-            logger.debug(f"{context_lens=}")
-            logger.debug(f"{context_lens_spec=}")
-            logger.debug(f"{block_tables=}")
-            logger.debug(f"{block_tables_spec=}")
-            self.logged_decode = True
+            # logger.debug(f"{context_lens=}")
+            # logger.debug(f"{context_lens_spec=}")
+            # logger.debug(f"{block_tables=}")
+            # logger.debug(f"{block_tables_spec=}")
+            # self.logged_decode = True
+            break
         set_context(
             False,
             slot_mapping=slot_mapping,
@@ -274,7 +284,7 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
         if self.rank == 0:
-            logger.info(f"{token_ids_gpu.shape=} {token_ids_gpu.dtype=} {token_ids_gpu.device=}")
+            logger.info(f"{token_ids_gpu.shape=} {token_ids_gpu.device=}")
         token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

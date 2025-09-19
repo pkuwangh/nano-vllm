@@ -60,16 +60,36 @@ class Sequence:
         return self.num_cached_tokens // self.block_size
 
     @property
-    def num_blocks_for_kvcache_alloc(self):
-        return (self.num_tokens_for_kvcache + self.block_size - 1) // self.block_size
-
-    @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
+    def num_blocks_for_kvcache_alloc(self):
+        return (self.num_tokens_for_kvcache + self.block_size - 1) // self.block_size
+
+    @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+    def get_decode_slot(self):
+        assert len(self.block_table) == self.num_blocks_for_kvcache_alloc
+        if self.num_tokens % self.block_size == 0:
+            assert self.num_blocks_for_kvcache_alloc == self.num_blocks + 1
+            assert len(self.block_table) > 1
+            return self.block_table[-2] * self.block_size + self.block_size - 1
+        else:
+            assert self.num_blocks_for_kvcache_alloc == self.num_blocks
+            return self.block_table[-1] * self.block_size + self.last_block_num_tokens - 1
+
+    def get_decode_slot_spec(self):
+        assert len(self.block_table) == self.num_blocks_for_kvcache_alloc
+        if self.num_tokens % self.block_size == 0:
+            assert self.num_blocks_for_kvcache_alloc == self.num_blocks + 1
+            assert len(self.block_table) > 1
+            return self.block_table[-1] * self.block_size
+        else:
+            assert self.num_blocks_for_kvcache_alloc == self.num_blocks
+            return self.block_table[-1] * self.block_size + self.last_block_num_tokens
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
