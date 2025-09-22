@@ -261,9 +261,9 @@ class ModelRunner:
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping_spec"].fill_(-1)
-            graph_vars["slot_mapping_spec"][:bs] = context.slot_mapping
+            graph_vars["slot_mapping_spec"][:bs] = context.slot_mapping_spec
             graph_vars["context_lens_spec"].zero_()
-            graph_vars["context_lens_spec"][:bs] = context.context_lens
+            graph_vars["context_lens_spec"][:bs] = context.context_lens_spec
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             self.hidden_states_spec = graph_vars["hidden_states"][:bs]
@@ -444,8 +444,8 @@ class ModelRunner:
             positions=positions,
             slot_mapping=slot_mapping,
             context_lens=context_lens,
-            slot_mapping_spec=slot_mapping,
-            context_lens_spec=context_lens,
+            slot_mapping_spec=slot_mapping_spec,
+            context_lens_spec=context_lens_spec,
             block_tables=block_tables,
             outputs=outputs,
             hidden_states=hidden_states,
