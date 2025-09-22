@@ -33,12 +33,14 @@ class ModelRunner:
         self.seqs_spec = None
         self.hidden_states_spec = None
         self.residual_spec = None
+        self.spec_layers = 5
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        self.spec_stream = torch.cuda.Stream(device="cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
@@ -47,6 +49,7 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -248,18 +251,51 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model_spec(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        self.hidden_states_spec, self.residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=5)
+        if self.enforce_eager:
+            self.hidden_states_spec, self.residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=self.spec_layers)
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.graphs["spec"][next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping_spec"].fill_(-1)
+            graph_vars["slot_mapping_spec"][:bs] = context.slot_mapping
+            graph_vars["context_lens_spec"].zero_()
+            graph_vars["context_lens_spec"][:bs] = context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph.replay()
+            self.hidden_states_spec = graph_vars["hidden_states"][:bs]
+            self.residual_spec = graph_vars["residual"][:bs]
 
     @torch.inference_mode()
     def run_model_resume(self, input_ids: torch.Tensor, positions: torch.Tensor):
-        hidden_states, _ = self.model.forward_resume(
-            input_ids,
-            positions,
-            resume_from_layer_index=6,
-            resume_hidden_states=self.hidden_states_spec,
-            resume_residual=self.residual_spec,
-        )
-        return self.model.compute_logits(hidden_states)
+        if self.enforce_eager:
+            hidden_states = self.model.forward_resume(
+                input_ids,
+                positions,
+                resume_from_layer_index=(self.spec_layers + 1),
+                resume_hidden_states=self.hidden_states_spec,
+                resume_residual=self.residual_spec,
+            )
+            return self.model.compute_logits(hidden_states)
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.graphs["resume"][next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph_vars["hidden_states"][:bs] = self.hidden_states_spec
+            graph_vars["residual"][:bs] = self.residual_spec
+            graph.replay()
+            return self.model.compute_logits(graph_vars["resume_outputs"][:bs])
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -289,8 +325,7 @@ class ModelRunner:
             input_ids, positions, self.positions_spec, self.slot_mapping_spec, self.context_lens_spec = self.prepare_decode(seqs)
         # wait till last-iteration's speculation is done
         if self.seqs_spec is not None:
-            stream = torch.cuda.default_stream()
-            stream.synchronize()
+            self.spec_stream.synchronize()
             reset_context_spec()
         # now really starts this iterations
         if is_prefill:
@@ -299,10 +334,10 @@ class ModelRunner:
             self.seqs_spec = None
             return token_ids
         else:
-            logits = self.run_model(input_ids, positions, is_prefill)
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            self.seqs_spec = None
-            return token_ids
+            # logits = self.run_model(input_ids, positions, is_prefill)
+            # token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            # self.seqs_spec = None
+            # return token_ids
 
             if (
                 self.seqs_spec is not None
@@ -310,22 +345,27 @@ class ModelRunner:
                 and all(a.seq_id == b.seq_id for a, b in zip(self.seqs_spec, seqs))
             ):
                 # sepculated last iteration and same batch, resume
-                logger.info("batch speculation was GOOD; resume from speculative executed layers")
+                # logger.info("batch speculation was GOOD; resume from speculative executed layers")
                 logits = self.run_model_resume(input_ids, positions)
             else:
                 # no speculation or mis-speculated
                 if self.seqs_spec is not None:
-                    logger.info("batch speculation was BAD; re-run from beginning")
+                    # logger.info("batch speculation was BAD; re-run from beginning")
+                    pass
                 logits = self.run_model(input_ids, positions, is_prefill=False)
             # queue the sampler first
             token_ids_gpu = self.sampler(logits, temperatures) if self.rank == 0 else None
+            # wait for above to finish
+            prod_stream = torch.cuda.current_stream(device="cuda")
+            self.spec_stream.wait_stream(prod_stream)
             # now speculate next iteration will have the same batch
-            set_context_spec(self.slot_mapping_spec, self.context_lens_spec)
-            self.seqs_spec = seqs
-            input_ids_spec = token_ids_gpu
-            # logger.info(f"Speculating with {input_ids_spec=} {self.positions_spec=} {input_ids_spec.device=} {self.positions_spec.device=}")
-            self.run_model_spec(input_ids_spec, self.positions_spec)
-            # above spec launch is async, let's process the sampled token_ids now
+            with torch.cuda.stream(self.spec_stream):
+                set_context_spec(self.slot_mapping_spec, self.context_lens_spec)
+                self.seqs_spec = seqs
+                input_ids_spec = token_ids_gpu
+                # logger.info(f"Speculating with {input_ids_spec=} {self.positions_spec=} {input_ids_spec.device=} {self.positions_spec.device=}")
+                self.run_model_spec(input_ids_spec, self.positions_spec)
+            # spec execution submitted; now do CPU business
             token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
             return token_ids
 
@@ -367,9 +407,13 @@ class ModelRunner:
 
             # spec graph
             graph2 = torch.cuda.CUDAGraph()
-            hidden_states[:bs], residual[:bs] = self.model.forward_spec(input_ids[:bs], positions[:bs], num_layers_to_run=5)  # warmup
+            hidden_states[:bs], residual[:bs] = self.model.forward_spec(
+                input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
+            )  # warmup
             with torch.cuda.graph(graph2, self.graph_pool):
-                hidden_states[:bs], residual[:bs] = self.model.forward_spec(input_ids[:bs], positions[:bs], num_layers_to_run=5)  # capture
+                hidden_states[:bs], residual[:bs] = self.model.forward_spec(
+                    input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
+                )  # capture
             self.graphs["spec"][bs] = graph2
             torch.cuda.synchronize()
 
@@ -378,7 +422,7 @@ class ModelRunner:
             resume_outputs[:bs] = self.model.forward_resume(
                 input_ids[:bs],
                 positions[:bs],
-                resume_from_layer_index=6,
+                resume_from_layer_index=(self.spec_layers + 1),
                 resume_hidden_states=hidden_states[:bs],
                 resume_residual=residual[:bs],
             )  # warmup
@@ -386,7 +430,7 @@ class ModelRunner:
                 resume_outputs[:bs] = self.model.forward_resume(
                     input_ids[:bs],
                     positions[:bs],
-                    resume_from_layer_index=6,
+                    resume_from_layer_index=(self.spec_layers + 1),
                     resume_hidden_states=hidden_states[:bs],
                     resume_residual=residual[:bs],
                 )
@@ -394,7 +438,6 @@ class ModelRunner:
             torch.cuda.synchronize()
 
             reset_context()
-
 
         self.graph_vars = dict(
             input_ids=input_ids,

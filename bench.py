@@ -15,8 +15,7 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    num_seqs = 16
-    max_ouput_len = 128
+    num_seqs = 32
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../models/Qwen3-8B/")
     llm = LLM(path, enforce_eager=False, max_model_len=4096)
