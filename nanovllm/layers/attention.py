@@ -2,7 +2,6 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
-from loguru import logger
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
@@ -62,7 +61,6 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             slot_mapping = context.slot_mapping_spec if is_spec else context.slot_mapping
-            # logger.debug(f"{is_spec=} {context.slot_mapping=} {context.slot_mapping_spec=} {slot_mapping=}")
             store_kvcache(k, v, k_cache, v_cache, slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache

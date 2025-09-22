@@ -1,7 +1,6 @@
 import pickle
 import torch
 import torch.distributed as dist
-from loguru import logger
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -23,8 +22,6 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self.logged_prefill = True
-        self.logged_decode = True
 
         self.input_ids_spec = None
         self.positions_spec = None
@@ -33,7 +30,7 @@ class ModelRunner:
         self.seqs_spec = None
         self.hidden_states_spec = None
         self.residual_spec = None
-        self.spec_layers = 5
+        self.spec_layers = config.num_speculative_layers
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -45,7 +42,6 @@ class ModelRunner:
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
-        self.reset_logging()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -61,11 +57,6 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
-
-    def reset_logging(self):
-        self.logged_prefill = False
-        self.logged_decode = False
-        self.sampler.reset_logging()
 
     def exit(self):
         if self.world_size > 1:
@@ -113,7 +104,6 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        logger.info(f"{max_num_batched_tokens=} {max_model_len=} {num_seqs=}")
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
@@ -126,34 +116,24 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        logger.info(f"{hf_config.num_hidden_layers=} {num_kv_heads=} {hf_config.head_dim=} {hf_config.torch_dtype=}")
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        logger.info(f"per-token/block KV cache size = {block_bytes / self.block_size / 1024:.2f} KB / {block_bytes / 1024:.2f} KB")
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
-        logger.info(f"{self.kv_cache.shape=} {self.kv_cache.dtype=} {self.kv_cache.device=}")
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                # logger.info(f"{layer_id=} {module.__class__.__name__}")
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-            else:
-                # logger.info(f"layer w/o KV: {module.__class__.__name__}")
-                pass
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]  # pad each seq's block_table
+        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        if not (self.logged_prefill and self.logged_decode):
-            logger.info(f"{block_tables.shape=}")
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
-        # prefill staging
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -164,40 +144,30 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])   # only the uncached tail
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))  # abs. token indices including prefix-cached
-            seqlen_q = seqlen - seq.num_cached_tokens       # new tokens (Q)
-            seqlen_k = seqlen                               # all tokens so far (Q + cached K)
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)    # cumulative lengths across sequences
+            input_ids.extend(seq[seq.num_cached_tokens:])
+            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            seqlen_q = seqlen - seq.num_cached_tokens
+            seqlen_k = seqlen
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):  # for uncached blocks only
+            for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
-                # where to write the KV for uncached tokens
-                slot_mapping.extend(list(range(start, end)))    # index for [start, end) into flattened KV cache space
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:                 # K > Q, at least one seq has cached prefix
-            block_tables = self.prepare_block_tables(seqs)      # block tables so attention can gather old K/V
+                slot_mapping.extend(list(range(start, end)))
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        while not self.logged_prefill:
-            logger.info(f"prefill staging: {len(seqs)=} {max_seqlen_q=} {max_seqlen_k=}")
-            logger.info(f"{input_ids.shape=} {cu_seqlens_q.shape=} {cu_seqlens_k.shape=} {slot_mapping.shape=}")
-            logger.debug(f"{input_ids=}")
-            logger.debug(f"{positions=}")
-            logger.debug(f"{slot_mapping=}")
-            logger.debug(f"{block_tables=}")
-            self.logged_prefill = True
-            break
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -210,12 +180,11 @@ class ModelRunner:
         slot_mapping_spec = []
         context_lens_spec = []
         for seq in seqs:
-            input_ids.append(seq.last_token)    # new input token is the last output token
+            input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             positions_spec.append(len(seq))
-            context_lens.append(len(seq))       # KV length this query should attend over
+            context_lens.append(len(seq))
             context_lens_spec.append(len(seq) + 1)
-            # where to write this token's KV
             slot_mapping.append(seq.get_decode_slot())
             slot_mapping_spec.append(seq.get_decode_slot_spec())
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -226,19 +195,6 @@ class ModelRunner:
         slot_mapping_spec = torch.tensor(slot_mapping_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_spec = torch.tensor(context_lens_spec, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        while not self.logged_decode:
-            logger.info(f"Decode staging: {len(seqs)=}")
-            logger.info(f"{input_ids.shape=} {slot_mapping.shape=} {context_lens.shape=} {block_tables.shape=}")
-            logger.debug(f"{input_ids=}")
-            logger.debug(f"{positions=}")
-            logger.debug(f"{positions_spec=}")
-            logger.debug(f"{slot_mapping=}")
-            logger.debug(f"{slot_mapping_spec=}")
-            logger.debug(f"{context_lens=}")
-            logger.debug(f"{context_lens_spec=}")
-            logger.debug(f"{block_tables=}")
-            self.logged_decode = True
-            break
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions, positions_spec, slot_mapping_spec, context_lens_spec
 
@@ -252,7 +208,11 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model_spec(self, input_ids: torch.Tensor, positions: torch.Tensor):
         if self.enforce_eager:
-            self.hidden_states_spec, self.residual_spec = self.model.forward_spec(input_ids, positions, num_layers_to_run=self.spec_layers)
+            self.hidden_states_spec, self.residual_spec = self.model.forward_spec(
+                input_ids,
+                positions,
+                num_layers_to_run=self.spec_layers,
+            )
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -344,12 +304,10 @@ class ModelRunner:
                 and all(a.seq_id == b.seq_id for a, b in zip(self.seqs_spec, seqs))
             ):
                 # sepculated last iteration and same batch, resume
-                # logger.info("batch speculation was GOOD; resume from speculative executed layers")
                 logits = self.run_model_resume(input_ids, positions)
             else:
                 # no speculation or mis-speculated
                 if self.seqs_spec is not None:
-                    # logger.info("batch speculation was BAD; re-run from beginning")
                     pass
                 logits = self.run_model(input_ids, positions, is_prefill=False)
             # queue the sampler first
@@ -362,7 +320,6 @@ class ModelRunner:
                 set_context_spec(self.slot_mapping_spec, self.context_lens_spec)
                 self.seqs_spec = seqs
                 input_ids_spec = token_ids_gpu
-                # logger.info(f"Speculating with {input_ids_spec=} {self.positions_spec=} {input_ids_spec.device=} {self.positions_spec.device=}")
                 self.run_model_spec(input_ids_spec, self.positions_spec)
             # spec execution submitted; now do CPU business
             token_ids = token_ids_gpu.tolist() if self.rank == 0 else None
