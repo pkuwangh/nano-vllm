@@ -327,18 +327,17 @@ class ModelRunner:
         if self.seqs_spec is not None:
             self.spec_stream.synchronize()
             reset_context_spec()
+        self.seqs_spec = None
         # now really starts this iterations
         if is_prefill:
             logits = self.run_model(input_ids, positions, is_prefill)
             token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            self.seqs_spec = None
+            return token_ids
+        elif self.spec_layers is None:
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
             return token_ids
         else:
-            # logits = self.run_model(input_ids, positions, is_prefill)
-            # token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            # self.seqs_spec = None
-            # return token_ids
-
             if (
                 self.seqs_spec is not None
                 and len(self.seqs_spec) == len(seqs)
@@ -405,39 +404,41 @@ class ModelRunner:
             self.graphs["default"][bs] = graph1
             torch.cuda.synchronize()
 
-            # spec graph
-            graph2 = torch.cuda.CUDAGraph()
-            hidden_states[:bs], residual[:bs] = self.model.forward_spec(
-                input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
-            )  # warmup
-            with torch.cuda.graph(graph2, self.graph_pool):
+            if self.spec_layers is not None:
+                # spec graph
+                graph2 = torch.cuda.CUDAGraph()
                 hidden_states[:bs], residual[:bs] = self.model.forward_spec(
                     input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
-                )  # capture
-            self.graphs["spec"][bs] = graph2
-            torch.cuda.synchronize()
+                )  # warmup
+                with torch.cuda.graph(graph2, self.graph_pool):
+                    hidden_states[:bs], residual[:bs] = self.model.forward_spec(
+                        input_ids[:bs], positions[:bs], num_layers_to_run=self.spec_layers
+                    )  # capture
+                self.graphs["spec"][bs] = graph2
+                torch.cuda.synchronize()
 
-            # resume graph
-            graph3 = torch.cuda.CUDAGraph()
-            resume_outputs[:bs] = self.model.forward_resume(
-                input_ids[:bs],
-                positions[:bs],
-                resume_from_layer_index=(self.spec_layers + 1),
-                resume_hidden_states=hidden_states[:bs],
-                resume_residual=residual[:bs],
-            )  # warmup
-            with torch.cuda.graph(graph3, self.graph_pool):
+                # resume graph
+                graph3 = torch.cuda.CUDAGraph()
                 resume_outputs[:bs] = self.model.forward_resume(
                     input_ids[:bs],
                     positions[:bs],
                     resume_from_layer_index=(self.spec_layers + 1),
                     resume_hidden_states=hidden_states[:bs],
                     resume_residual=residual[:bs],
-                )
-            self.graphs["resume"][bs] = graph3
-            torch.cuda.synchronize()
+                )  # warmup
+                with torch.cuda.graph(graph3, self.graph_pool):
+                    resume_outputs[:bs] = self.model.forward_resume(
+                        input_ids[:bs],
+                        positions[:bs],
+                        resume_from_layer_index=(self.spec_layers + 1),
+                        resume_hidden_states=hidden_states[:bs],
+                        resume_residual=residual[:bs],
+                    )
+                self.graphs["resume"][bs] = graph3
+                torch.cuda.synchronize()
 
             reset_context()
+            reset_context_spec()
 
         self.graph_vars = dict(
             input_ids=input_ids,

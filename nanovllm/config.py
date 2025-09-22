@@ -16,6 +16,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_speculative_layers: int | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
