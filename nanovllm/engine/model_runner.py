@@ -25,16 +25,34 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        self.green_context = None
+        self.partitions = None
+        self.execution_stream = None
+        if config.prefill_sm_fraction is not None:
+            from nanovllm.utils.green_context import GreenContextPair
+
+            self.partitions = GreenContextPair(config.prefill_sm_fraction, rank)
+            self.execution_stream = self.partitions.streams[1]
+        elif config.num_sms is not None:
+            self.green_context = torch.cuda.GreenContext(num_sms=config.num_sms, device_id=rank)
+            self.execution_stream = self.green_context.Stream()
+            self.execution_stream.wait_stream(torch.cuda.current_stream())
+        self.prefill_stream = self.partitions.streams[0] if self.partitions else self.execution_stream
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        with torch.cuda.stream(self.execution_stream):
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+            self.sampler = Sampler()
+            if self.partitions:
+                self.prefill_stream.wait_stream(self.execution_stream)
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        if self.execution_stream is not None:
+            self.execution_stream.synchronize()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -57,6 +75,8 @@ class ModelRunner:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
+        if self.partitions:
+            self.partitions.close()
 
     def loop(self):
         while True:
@@ -212,12 +232,16 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
-        return token_ids
+        phase = "prefill" if is_prefill else "decode"
+        stream = self.prefill_stream if is_prefill else self.execution_stream
+        with torch.cuda.stream(stream), torch.cuda.nvtx.range(phase):
+            try:
+                input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+                temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+                logits = self.run_model(input_ids, positions, is_prefill)
+                return self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            finally:
+                reset_context()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -231,7 +255,9 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [bs for bs in [1, 2, 4, 8] + list(range(16, max_bs + 1, 16)) if bs <= max_bs]
+        if max_bs not in self.graph_bs:
+            self.graph_bs.append(max_bs)
         self.graphs = {}
         self.graph_pool = None
 
@@ -239,7 +265,8 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            # Graph nodes must be captured on the same SM partition as execution.
+            with torch.cuda.graph(graph, self.graph_pool, stream=self.execution_stream):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
